@@ -1,0 +1,16 @@
+name = "demo-greeting"
+model = "x-preview-f-free"
+net_egress = []
+max_subagents = 4
+subagent_depth = 4
+output_token_max = 4096
+context_limit = 262144
+
+[resources]
+cpus = 1
+memory_mb = 1024
+
+[timeouts]
+build_sec = 300
+agent_sec = 600
+verifier_sec = 120
