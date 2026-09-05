@@ -15,7 +15,7 @@ from pathlib import Path
 from .compose_gen import BASE_IMAGE, build_compose, write_compose
 from .manifest import build_manifest
 from .redact import redact_tree
-from .spec import SpecError, TaskSpec
+from .spec import SpecError, TaskSpec, validate_judge_base_url, validate_model_id
 
 IMAGES_DIR = Path(__file__).resolve().parent / "images"
 _REDACTED_STAMP = ".redacted"
@@ -79,6 +79,9 @@ def _compose_token(compose: dict) -> str:
 
 
 def _scrub_compose_token(compose_file: Path, token: str) -> None:
+    # NOTE: the placeholder must stay a plain YAML scalar. "[REDACTED]" would
+    # parse as a flow sequence and break `docker compose down` validation
+    # (that bug stranded every run's containers with "teardown incomplete").
     if not token or not compose_file.is_file():
         return
     try:
@@ -88,7 +91,7 @@ def _scrub_compose_token(compose_file: Path, token: str) -> None:
     if token not in text:
         return
     try:
-        compose_file.write_text(text.replace(token, "[REDACTED]"), encoding="utf-8")
+        compose_file.write_text(text.replace(token, "REDACTED"), encoding="utf-8")
     except OSError:
         pass
 
@@ -292,6 +295,8 @@ def run_task(
     keep: bool = False,
     console=None,
     model_override: str | None = None,
+    judge_model_override: str | None = None,
+    judge_base_url_override: str | None = None,
 ) -> RunResult:
     base_url = os.environ.get("SWARM_LLM_BASE_URL")
     if not base_url:
@@ -300,10 +305,15 @@ def run_task(
             "(any OpenAI-compatible or Anthropic endpoint; omit SWARM_LLM_API_KEY only for keyless servers like local Ollama)"
         )
     if model_override is not None:
-        model_override = str(model_override).strip()
-        if not model_override:
-            raise SpecError("-m/--model must be a non-empty model id")
-        spec.model = model_override
+        spec.model = validate_model_id(model_override)
+    if not spec.model:
+        raise SpecError(
+            "no model configured: set 'model' in task.toml or pass -m/--model"
+        )
+    if judge_model_override is not None:
+        spec.judge_model = validate_model_id(judge_model_override)
+    if judge_base_url_override is not None:
+        spec.judge_base_url = validate_judge_base_url(judge_base_url_override)
     base_url, url_warning = _normalize_base_url(base_url)
     cleartext_warning = _validate_base_url(base_url)
     flavor = _detect_flavor(base_url)
@@ -315,6 +325,10 @@ def run_task(
         log(f"[yellow]warning: {cleartext_warning} — prefer an https:// upstream[/]")
     if not os.environ.get("SWARM_LLM_API_KEY"):
         log("[yellow]SWARM_LLM_API_KEY not set — proxy will forward without auth header[/]")
+    if (spec.judge_base_url
+            and not os.environ.get("SWARM_JUDGE_API_KEY")
+            and not os.environ.get("SWARM_LLM_API_KEY")):
+        log("[yellow]SWARM_JUDGE_API_KEY not set — judge proxy will forward without auth header[/]")
 
     from .ui import make_display
 
@@ -327,7 +341,7 @@ def run_task(
     for sub in ("work", "agent_logs", "verification"):
         (results / sub).mkdir(parents=True, exist_ok=True)
 
-    compose = build_compose(spec, results, IMAGES_DIR, mode, base_url, flavor=flavor)
+    compose = build_compose(spec, results, IMAGES_DIR, mode, base_url, flavor=flavor, judge_model=spec.judge_model, judge_base_url=spec.judge_base_url)
     compose_file = write_compose(compose, results)
 
     started = time.monotonic()
@@ -357,6 +371,7 @@ def run_task(
                 compose_file, project, "up", "-d", "--build",
                 "llmproxy",
                 *(["egress"] if spec.internet_mode == "allowlist" else []),
+                *(["judgeproxy"] if "judgeproxy" in compose.get("services", {}) else []),
                 timeout=spec.build_timeout_sec + 120,
             )
             if up.returncode != 0:
@@ -437,6 +452,11 @@ def run_task(
                     "duration_sec": duration,
                     "internet_mode": spec.internet_mode,
                 "net_egress": spec.net_egress,
+                    "coordination_pattern": spec.coordination_pattern,
+                    "tags": spec.tags,
+                    "judge_model": spec.judge_model or spec.model,
+                    "judge_base_url": spec.judge_base_url or "",
+                    "provider_npm": spec.provider_npm or "",
                 },
             )
             display.finish("finalize", "ok", note=f"{duration}s total")
@@ -466,11 +486,141 @@ def _scrub_oracle_logs(results: Path) -> None:
             pass
 
 
+def regrade_task(
+    spec: TaskSpec,
+    logs_src: Path,
+    keep: bool = False,
+    console=None,
+    judge_model_override: str | None = None,
+    judge_base_url_override: str | None = None,
+) -> RunResult:
+    """Re-run ONLY the verifier over existing agent logs (e.g. judge was down).
+
+    Never touches the source run: logs are copied into a fresh
+    results/<id>-regrade/ directory with its own reward + manifest that links
+    back via source_run. The original run.json stays tamper-evident, so this
+    is not a reward re-minting path.
+    """
+    import shutil
+
+    logs_src = Path(logs_src)
+    if not logs_src.is_dir():
+        raise SpecError(f"logs directory not found: {logs_src}")
+    if judge_model_override is not None:
+        spec.judge_model = validate_model_id(judge_model_override)
+    if judge_base_url_override is not None:
+        spec.judge_base_url = validate_judge_base_url(judge_base_url_override)
+    if not (spec.judge_model or spec.model):
+        raise SpecError(
+            "no judge model configured: set 'judge_model'/'model' in task.toml "
+            "or pass --judge-model"
+        )
+    base_url = os.environ.get("SWARM_LLM_BASE_URL")
+    if not base_url:
+        raise SpecError("SWARM_LLM_BASE_URL is required in the environment")
+    base_url, url_warning = _normalize_base_url(base_url)
+    cleartext_warning = _validate_base_url(base_url)
+    flavor = _detect_flavor(base_url)
+
+    from .ui import make_display
+
+    display = make_display(console)
+    log = console.log if console else print
+    if url_warning:
+        log(f"[yellow]{url_warning}[/]")
+    if cleartext_warning:
+        log(f"[yellow]warning: {cleartext_warning} — prefer an https:// upstream[/]")
+
+    source_run = logs_src.parent.name if logs_src.name == "agent_logs" else logs_src.name
+    run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}-regrade"
+    project = f"swarm-regrade-{spec.name}-{run_id}".lower()
+    sweep_stale_results(spec.root)
+    results = spec.root / "results" / run_id
+    for sub in ("work", "agent_logs", "verification"):
+        (results / sub).mkdir(parents=True, exist_ok=True)
+    for item in sorted(logs_src.iterdir()):
+        if item.name == _REDACTED_STAMP or item.is_symlink():
+            continue
+        dest = results / "agent_logs" / item.name
+        try:
+            if item.is_dir():
+                shutil.copytree(item, dest, symlinks=False)
+            elif item.is_file():
+                shutil.copy2(item, dest)
+        except OSError as exc:
+            print(f"warning: could not copy {item}: {exc}", file=sys.stderr)
+
+    compose = build_compose(spec, results, IMAGES_DIR, mode="single",
+                            upstream_base=base_url, flavor=flavor,
+                            judge_model=spec.judge_model,
+                            judge_base_url=spec.judge_base_url)
+    compose_file = write_compose(compose, results)
+    started = time.monotonic()
+    redactions = 0
+    try:
+        with display:
+            display.begin("images", cap=float(spec.build_timeout_sec))
+            _pull_verifier(spec)
+            up = _dc(
+                compose_file, project, "up", "-d", "--build", "llmproxy",
+                *(["judgeproxy"] if "judgeproxy" in compose.get("services", {}) else []),
+                timeout=spec.build_timeout_sec + 120,
+            )
+            if up.returncode != 0:
+                display.finish("images", "failed", note="compose up error")
+                raise RuntimeError(f"compose up failed:\n{up.stderr[-2000:]}")
+            display.finish("images", "ok")
+
+            display.begin("verify", cap=float(spec.verifier_timeout_sec))
+            _strip_symlinks(results / "agent_logs")
+            redactions = redact_tree(results / "agent_logs")
+            _stamp_redacted(results / "agent_logs")
+            verifier_rc = _run_verifier(compose_file, project, spec, results)
+            reward = _finalize_reward(results, verifier_rc)
+            display.finish("verify", "ok", note=f"{len(reward.get('checks', []))} checks · {redactions} redactions")
+
+            display.begin("finalize", cap=60.0)
+            duration = round(time.monotonic() - started, 1)
+            _scrub_compose_token(compose_file, _compose_token(compose))
+            build_manifest(
+                results,
+                {
+                    "run_id": run_id,
+                    "kind": "regrade",
+                    "source_run": source_run,
+                    "task": spec.name,
+                    "model": spec.model,
+                    "judge_model": spec.judge_model or spec.model,
+                    "judge_base_url": spec.judge_base_url or "",
+                    "llm_base_url": base_url,
+                    "llm_flavor": flavor,
+                    "reward": reward,
+                    "secret_redactions": redactions,
+                    "duration_sec": duration,
+                    "internet_mode": spec.internet_mode,
+                    "net_egress": spec.net_egress,
+                    "coordination_pattern": spec.coordination_pattern,
+                    "tags": spec.tags,
+                    "provider_npm": spec.provider_npm or "",
+                },
+            )
+            display.finish("finalize", "ok", note=f"{duration}s total")
+            return RunResult(run_id, results, "regraded", None, reward,
+                             redactions, spec.internet_mode)
+    finally:
+        if not keep:
+            down = _dc(compose_file, project, "down", "-v", "--remove-orphans", timeout=120)
+            if down.returncode != 0 and console:
+                console.print("[yellow]warning:[/] teardown incomplete — check dangling containers/networks")
+
+
 def run_oracle(
     spec: TaskSpec,
     keep: bool = False,
     threshold: float | None = None,
     console=None,
+    judge_model_override: str | None = None,
+    judge_base_url_override: str | None = None,
 ) -> OracleResult:
     solution = spec.solution_script
     if not solution:
@@ -478,6 +628,10 @@ def run_oracle(
             f"no solution/solve.sh found in {spec.root} — oracle mode is optional "
             "and only runs for tasks that ship a reference solution"
         )
+    if judge_model_override is not None:
+        spec.judge_model = validate_model_id(judge_model_override)
+    if judge_base_url_override is not None:
+        spec.judge_base_url = validate_judge_base_url(judge_base_url_override)
     base_url = os.environ.get("SWARM_LLM_BASE_URL")
     if not base_url:
         raise SpecError("SWARM_LLM_BASE_URL is required in the environment")
@@ -497,6 +651,10 @@ def run_oracle(
         log(f"[yellow]warning: {cleartext_warning} — prefer an https:// upstream[/]")
     if not os.environ.get("SWARM_LLM_API_KEY"):
         log("[yellow]SWARM_LLM_API_KEY not set — proxy will forward without auth header[/]")
+    if (spec.judge_base_url
+            and not os.environ.get("SWARM_JUDGE_API_KEY")
+            and not os.environ.get("SWARM_LLM_API_KEY")):
+        log("[yellow]SWARM_JUDGE_API_KEY not set — judge proxy will forward without auth header[/]")
 
     run_id = f"oracle-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     project = f"swarm-oracle-{spec.name}-{run_id}".lower()
@@ -505,7 +663,7 @@ def run_oracle(
     for sub in ("work", "agent_logs", "verification"):
         (results / sub).mkdir(parents=True, exist_ok=True)
 
-    compose = build_compose(spec, results, IMAGES_DIR, mode="single", upstream_base=base_url, flavor=flavor)
+    compose = build_compose(spec, results, IMAGES_DIR, mode="single", upstream_base=base_url, flavor=flavor, judge_model=spec.judge_model, judge_base_url=spec.judge_base_url)
     compose_file = write_compose(compose, results)
 
     oracle_status = "passed_execution"
@@ -517,6 +675,7 @@ def run_oracle(
             up = _dc(
                 compose_file, project, "up", "-d", "--build", "llmproxy",
                 *(["egress"] if spec.internet_mode == "allowlist" else []),
+                *(["judgeproxy"] if "judgeproxy" in compose.get("services", {}) else []),
                 timeout=spec.build_timeout_sec + 120,
             )
             if up.returncode != 0:
@@ -570,6 +729,11 @@ def run_oracle(
                     "passed": passed,
                     "reward": reward,
                     "net_egress": spec.net_egress,
+                    "coordination_pattern": spec.coordination_pattern,
+                    "tags": spec.tags,
+                    "judge_model": spec.judge_model or spec.model,
+                    "judge_base_url": spec.judge_base_url or "",
+                    "provider_npm": spec.provider_npm or "",
                 },
             )
             display.finish("finalize", "ok")

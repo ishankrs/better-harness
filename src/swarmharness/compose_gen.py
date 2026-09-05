@@ -19,6 +19,8 @@ def build_compose(
     mode: str,
     upstream_base: str,
     flavor: str = "openai",
+    judge_model: str = "",
+    judge_base_url: str = "",
 ) -> dict:
     networks: dict = {"internal": {"internal": True}, "uplink": {}}
     agent_networks = ["internal"]
@@ -88,6 +90,43 @@ def build_compose(
         },
     }
 
+    # Dedicated judge proxy: only when the judge uses a different upstream.
+    # The real judge key lives here alone (SWARM_JUDGE_API_KEY, falling back to
+    # the agent key); the verifier only ever holds the per-run runner token.
+    # Placeholders only — no secret is written to the compose file.
+    judge_upstream = (judge_base_url or spec.judge_base_url or "").strip()
+    judge_proxy_services: list[str] = []
+    judge_base_for_verifier = ""
+    if judge_upstream:
+        services["judgeproxy"] = {
+            "build": {"context": str(images_dir / "proxy")},
+            "environment": {
+                "UPSTREAM_BASE": judge_upstream,
+                "LLM_API_KEY": "${SWARM_JUDGE_API_KEY:-${SWARM_LLM_API_KEY:-}}",
+                "AUTH_MODE": flavor,
+                "RUNNER_TOKEN": runner_token,
+            },
+            "networks": proxy_networks,
+            "extra_hosts": ["host.docker.internal:host-gateway"],
+            "mem_limit": "256m",
+            "pids_limit": 128,
+            "restart": "on-failure",
+            "healthcheck": {
+                "test": [
+                    "CMD",
+                    "python",
+                    "-c",
+                    f"import urllib.request;urllib.request.urlopen('http://127.0.0.1:{PROXY_PORT}/__health',timeout=2)",
+                ],
+                "interval": "3s",
+                "timeout": "3s",
+                "retries": 20,
+                "start_period": "2s",
+            },
+        }
+        judge_proxy_services = ["judgeproxy"]
+        judge_base_for_verifier = f"http://judgeproxy:{PROXY_PORT}/v1"
+
     volumes = [
         f"{spec.instruction_path}:/task/instruction.md:ro",
         f"{results / 'agent_logs'}:/logs/agent",
@@ -110,6 +149,14 @@ def build_compose(
             "MODE": mode,
             "MODEL_ID": spec.model,
             "PROVIDER_KIND": "anthropic" if flavor == "anthropic" else "openai-compatible",
+            # Exact AI SDK package opencode loads. Blank task value keeps the
+            # flavor default; set "@ai-sdk/openai" for Responses-API models
+            # (e.g. opencode.ai Zen responses endpoints).
+            "PROVIDER_NPM": (
+                spec.provider_npm
+                or ("@ai-sdk/anthropic" if flavor == "anthropic"
+                    else "@ai-sdk/openai-compatible")
+            ),
             "CONTEXT_LIMIT": str(spec.context_limit),
             "OUTPUT_TOKEN_MAX": str(spec.output_token_max),
             "SUBAGENT_DEPTH": str(spec.subagent_depth),
@@ -128,7 +175,10 @@ def build_compose(
         "volumes": volumes,
     }
 
-    verifier_depends = {"llmproxy": {"condition": "service_healthy"}}
+    verifier_depends = {
+        "llmproxy": {"condition": "service_healthy"},
+        **{name: {"condition": "service_healthy"} for name in judge_proxy_services},
+    }
 
     if spec.solution_dir:
         services["oracle"] = {
@@ -158,6 +208,14 @@ def build_compose(
         "environment": {
             "LLM_BASE_URL": f"http://llmproxy:{PROXY_PORT}/v1",
             "LLM_API_KEY": runner_token,
+            # Lets task verifiers run an LLM judge through the proxy when no
+            # vendor key is available (verifiers must still fail closed without
+            # it). Precedence per field: --judge-* flag > task.toml judge_* >
+            # agent value (model) / dedicated judge proxy (base url, blank = same
+            # proxy as the agent). JUDGE_BASE_URL is a proxy address, never the
+            # real upstream — the upstream URL stays in the judgeproxy service.
+            "JUDGE_MODEL": judge_model or spec.judge_model or spec.model,
+            "JUDGE_BASE_URL": judge_base_for_verifier,
         },
         "networks": ["internal"],
         "mem_limit": f"{min(spec.memory_mb, 4096)}m",

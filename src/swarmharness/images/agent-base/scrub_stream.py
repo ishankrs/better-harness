@@ -26,6 +26,14 @@ _PATTERNS = [
         r"[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9._+/=-]{12,}"
     ),
 ]
+# Bare-40 kept out of the shared list: only evaluated gap-bounded, so
+# squash-joined camelCase in JSONL transcript lines can't false-positive
+# (same corruption class as the host redactor's llm_status.json bug).
+_BARE40 = re.compile(
+    r"(?<![A-Za-z0-9/+=])(?![0-9a-f]{40}[^A-Za-z0-9/+=])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])"
+)
+_PATTERNS = _PATTERNS + [_BARE40]
+_BARE40_MAX_GAP = 12
 _REPLACEMENT = "[REDACTED]"
 _CHUNK = 1024 * 1024
 _MAX_PENDING = 4 * 1024 * 1024
@@ -171,14 +179,17 @@ def scrub_block(text: str) -> str:
         text = _apply_spans(text, _multidecode_spans(text, _unquote_map))
         text = _apply_spans(text, _multidecode_spans(text, _json_unescape_map))
         squashed, index = _squash_map(text)
-        text = _apply_spans(
-            text,
-            [
-                (index[m.start()], index[m.end() - 1] + 1)
-                for pattern in _PATTERNS
-                for m in pattern.finditer(squashed)
-            ],
-        )
+        spans = [
+            (index[m.start()], index[m.end() - 1] + 1)
+            for pattern in _PATTERNS
+            if pattern is not _BARE40
+            for m in pattern.finditer(squashed)
+        ]
+        for m in _BARE40.finditer(squashed):
+            s, e = index[m.start()], index[m.end() - 1] + 1
+            if e - s - (m.end() - m.start()) <= _BARE40_MAX_GAP:
+                spans.append((s, e))
+        text = _apply_spans(text, spans)
         if text == prev:
             break
     return text

@@ -16,9 +16,10 @@ DEPTH = _int_env("SUBAGENT_DEPTH", 8, 0, 64)
 PROVIDER_KIND = os.environ.get("PROVIDER_KIND", "openai-compatible")
 
 if PROVIDER_KIND == "anthropic":
-    PROVIDER_NPM = "@ai-sdk/anthropic"
+    _DEFAULT_NPM = "@ai-sdk/anthropic"
 else:
-    PROVIDER_NPM = "@ai-sdk/openai-compatible"
+    _DEFAULT_NPM = "@ai-sdk/openai-compatible"
+PROVIDER_NPM = os.environ.get("PROVIDER_NPM", "").strip() or _DEFAULT_NPM
 
 HEADLESS_RULES = (
     "\n\n## Non-Interactive Execution\n"

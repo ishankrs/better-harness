@@ -9,7 +9,12 @@ NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 
 TASK_TOML = """\
 name = "{name}"
-model = "x-preview-f-free"
+model = ""
+# provider_npm = ""
+# judge_model = ""
+# judge_base_url = ""
+# coordination_pattern = ""
+# tags = []
 net_egress = []
 max_subagents = 4
 subagent_depth = 4
@@ -41,6 +46,9 @@ exist for grading purposes.
 
 DOCKERFILE = """\
 FROM swarmharness/agent-base:latest
+# For published tasks, pin the exact base you built against so every machine
+# runs identical bytes (`docker inspect swarmharness/agent-base:latest -f '{{.Id}}'`):
+# FROM swarmharness/agent-base:latest@sha256:<digest>
 """
 
 VERIFY_PY = '''\

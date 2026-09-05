@@ -54,6 +54,11 @@ class TaskSpec:
     context_limit: int
     output_token_max: int
     oracle_threshold: float
+    coordination_pattern: str = ""
+    tags: list[str] = field(default_factory=list)
+    judge_model: str = ""
+    judge_base_url: str = ""
+    provider_npm: str = ""
     sub_tasks: list[dict] = field(default_factory=list)
 
     @property
@@ -119,6 +124,71 @@ def _merged(raw: dict) -> dict:
     return merged
 
 
+def validate_model_id(model: str) -> str:
+    model = str(model).strip()
+    if not model:
+        raise SpecError("-m/--model must be a non-empty model id")
+    if not MODEL_RE.fullmatch(model):
+        raise SpecError(
+            f"invalid model id {model!r}: allowed characters are letters, digits, "
+            "'.', '_', '/', '@', ':', '+', '-' (max 200 chars)"
+        )
+    if ".." in model or model.startswith(("/", ".")):
+        raise SpecError(
+            f"invalid model id {model!r}: '..' segments and leading '/' or '.' are not allowed"
+        )
+    return model
+
+
+# AI SDK packages opencode may load as the agent provider. Tight allowlist:
+# the string becomes an npm install inside the sandbox.
+PROVIDER_NPM_ALLOWLIST = frozenset({
+    "@ai-sdk/openai",
+    "@ai-sdk/openai-compatible",
+    "@ai-sdk/anthropic",
+    "@ai-sdk/google",
+})
+
+
+def validate_provider_npm(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    if value not in PROVIDER_NPM_ALLOWLIST:
+        raise SpecError(
+            f"invalid provider_npm {value!r}: must be one of "
+            f"{sorted(PROVIDER_NPM_ALLOWLIST)}"
+        )
+    return value
+
+
+def validate_judge_base_url(raw_url: str) -> str:
+    """Optional separate API root for the verifier judge. Blank (default)
+    means the run's base URL. Otherwise same contract as SWARM_LLM_BASE_URL:
+    API root, http(s), no embedded credentials/query/fragment."""
+    import urllib.parse
+
+    url = str(raw_url or "").strip().rstrip("/")
+    if not url:
+        return ""
+    if url.endswith("/chat/completions"):
+        url = url[: -len("/chat/completions")]
+    if url.endswith("/v1"):
+        url = url[: -len("/v1")]
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in {"http", "https"}:
+        raise SpecError(
+            f"judge_base_url must use http:// or https:// (got {parts.scheme!r})"
+        )
+    if parts.username or parts.password:
+        raise SpecError("judge_base_url must not embed credentials (userinfo)")
+    if parts.query or parts.fragment:
+        raise SpecError(
+            "judge_base_url must not contain a query string or fragment"
+        )
+    return url
+
+
 def _oracle_threshold(raw: dict) -> float:
     section = raw.get("oracle") or {}
     if not isinstance(section, dict):
@@ -155,18 +225,11 @@ def load_task(root: Path) -> TaskSpec:
         raise SpecError("tests/verify.py is required")
 
     cfg = _merged(raw)
+    # 'model' may be empty here — `swarm run -m/--model` can supply it.
+    # The requirement is enforced at run time, not at load time.
     model = str(cfg["model"]).strip()
-    if not model:
-        raise SpecError("task.toml: 'model' is required (any model id your endpoint serves)")
-    if not MODEL_RE.fullmatch(model):
-        raise SpecError(
-            f"invalid model id {model!r}: allowed characters are letters, digits, "
-            "'.', '_', '/', '@', ':', '+', '-' (max 200 chars)"
-        )
-    if ".." in model or model.startswith(("/", ".")):
-        raise SpecError(
-            f"invalid model id {model!r}: '..' segments and leading '/' or '.' are not allowed"
-        )
+    if model:
+        model = validate_model_id(model)
 
     verifier_image = str(cfg["verifier_image"])
     if (
@@ -214,10 +277,44 @@ def load_task(root: Path) -> TaskSpec:
             "domain — an empty allowlist would grant unrestricted network access"
         )
 
+    coordination = str(raw.get("coordination_pattern") or "").strip()
+    if coordination and not ID_RE.match(coordination):
+        raise SpecError(
+            f"invalid coordination_pattern {coordination!r}: letters/digits/dots/dashes, "
+            "must start with a letter, max 64 chars"
+        )
+
+    tags_raw = raw.get("tags") or []
+    if not isinstance(tags_raw, list):
+        raise SpecError("task.toml: tags must be an array of strings")
+    tags = []
+    for t in tags_raw:
+        t = str(t).strip()
+        if not ID_RE.match(t):
+            raise SpecError(
+                f"invalid tag {t!r}: letters/digits/dots/dashes, "
+                "must start with a letter, max 64 chars"
+            )
+        if t not in tags:
+            tags.append(t)
+
+    # Optional judge model for verifier LLM judges. Blank (default) means the
+    # run's agent model is used; the CLI --judge-model flag overrides this.
+    judge_model = str(raw.get("judge_model") or "").strip()
+    if judge_model:
+        judge_model = validate_model_id(judge_model)
+    judge_base_url = validate_judge_base_url(raw.get("judge_base_url") or "")
+    provider_npm = validate_provider_npm(raw.get("provider_npm") or "")
+
     spec = TaskSpec(
         root=root,
         name=str(name),
         model=model,
+        coordination_pattern=coordination,
+        tags=tags,
+        judge_model=judge_model,
+        judge_base_url=judge_base_url,
+        provider_npm=provider_npm,
         verifier_image=str(cfg["verifier_image"]),
         cpus=float(cfg["cpus"]),
         memory_mb=int(cfg["memory_mb"]),
@@ -236,6 +333,18 @@ def load_task(root: Path) -> TaskSpec:
     decomp = spec.decomposition_path
     if decomp:
         spec.sub_tasks = parse_decomposition(decomp)
+        if not spec.coordination_pattern:
+            try:
+                top = yaml.safe_load(decomp.read_text()) or {}
+            except yaml.YAMLError as exc:
+                raise SpecError(f"decomposition.yaml: invalid YAML ({exc})")
+            pattern = str((top.get("coordination_pattern") or "")).strip()
+            if pattern:
+                if not ID_RE.match(pattern):
+                    raise SpecError(
+                        f"decomposition.yaml: bad coordination_pattern {pattern!r}"
+                    )
+                spec.coordination_pattern = pattern
     return spec
 
 

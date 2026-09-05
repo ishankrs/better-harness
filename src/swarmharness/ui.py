@@ -119,10 +119,10 @@ def _fmt_secs(s: float) -> str:
 def print_run_summary(console, result) -> None:
     if console is None:
         console = _bare_console()
-    ok = result.status == "completed" and result.reward.get("score", 0.0) >= 0.999
-    color = "green" if ok else ("yellow" if result.status == "completed" else "red")
+    ok = result.status in ("completed", "regraded") and result.reward.get("score", 0.0) >= 0.999
+    color = "green" if ok else ("yellow" if result.status in ("completed", "regraded") else "red")
     rows = [
-        ("score", f"[bold]{escape(str(result.reward.get('score')))}[/] ({escape(str(result.reward.get('status')))})"),
+        ("score", f"{result.reward.get('score')} ({result.reward.get('status')})"),
         ("checks", result.reward.get("checks", [])),
         ("agent exit", result.exit_code),
         ("redactions", result.redactions),
@@ -145,7 +145,7 @@ def print_oracle_summary(console, result) -> None:
     table = _summary_table(
         title=f"oracle · {'PASSED' if result.passed else 'FAILED'}",
         rows=[
-            ("score", f"[bold]{escape(str(result.reward.get('score')))}[/] ({escape(str(result.reward.get('status')))})"),
+            ("score", f"{result.reward.get('score')} ({result.reward.get('status')})"),
             ("threshold", result.threshold),
             ("execution", result.status),
             ("results", str(result.results_dir)),
