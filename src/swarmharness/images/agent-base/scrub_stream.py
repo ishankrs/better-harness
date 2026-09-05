@@ -1,10 +1,5 @@
-from __future__ import annotations
-
 import re
-import stat
 import sys
-import urllib.parse
-from pathlib import Path
 
 _PATTERNS = [
     re.compile(r"fw_[A-Za-z0-9]{16,}"),
@@ -32,21 +27,22 @@ _PATTERNS = [
     ),
 ]
 _REPLACEMENT = "[REDACTED]"
+_CHUNK = 1024 * 1024
+_MAX_PENDING = 4 * 1024 * 1024
 _SKIP_CHARS = set(" \t\r\n\\\"'+,:;")
 _HEX_DIGITS = set("0123456789abcdefABCDEF")
-_MAX_FILE_BYTES = 256 * 1024 * 1024
 _JSON_SIMPLE_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", '"': '"', "'": "'", "\\": "\\", "/": "/"}
+# Best-effort live scrub only; the host-side redact_tree() after the run is
+# authoritative and also handles multi-line splits spanning flush boundaries.
 
 
-def redact_text(text: str) -> tuple[str, int]:
-    count = 0
+def _redact_text(text: str) -> str:
     for pattern in _PATTERNS:
-        text, n = pattern.subn(_REPLACEMENT, text)
-        count += n
-    return text, count
+        text = pattern.sub(_REPLACEMENT, text)
+    return text
 
 
-def _squash_map(text: str) -> tuple[str, list[int]]:
+def _squash_map(text: str):
     chars: list[str] = []
     index: list[int] = []
     for i, ch in enumerate(text):
@@ -56,26 +52,16 @@ def _squash_map(text: str) -> tuple[str, list[int]]:
     return "".join(chars), index
 
 
-def _unquote_map(text: str) -> tuple[str, list[int], list[int]]:
+def _unquote_map(text: str):
     chars: list[str] = []
     starts: list[int] = []
     ends: list[int] = []
     i, n = 0, len(text)
     while i < n:
-        if (
-            text[i] == "%"
-            and i + 3 <= n
-            and text[i + 1] in _HEX_DIGITS
-            and text[i + 2] in _HEX_DIGITS
-        ):
+        if text[i] == "%" and i + 3 <= n and text[i + 1] in _HEX_DIGITS and text[i + 2] in _HEX_DIGITS:
             j = i
             buf = bytearray()
-            while (
-                j + 3 <= n
-                and text[j] == "%"
-                and text[j + 1] in _HEX_DIGITS
-                and text[j + 2] in _HEX_DIGITS
-            ):
+            while j + 3 <= n and text[j] == "%" and text[j + 1] in _HEX_DIGITS and text[j + 2] in _HEX_DIGITS:
                 buf.append(int(text[j + 1 : j + 3], 16))
                 j += 3
             try:
@@ -95,7 +81,7 @@ def _unquote_map(text: str) -> tuple[str, list[int], list[int]]:
     return "".join(chars), starts, ends
 
 
-def _json_unescape_map(text: str) -> tuple[str, list[int], list[int]]:
+def _json_unescape_map(text: str):
     chars: list[str] = []
     starts: list[int] = []
     ends: list[int] = []
@@ -104,9 +90,8 @@ def _json_unescape_map(text: str) -> tuple[str, list[int], list[int]]:
         if text[i] == "\\" and i + 1 < n:
             nxt = text[i + 1]
             if nxt == "u" and i + 6 <= n and all(c in _HEX_DIGITS for c in text[i + 2 : i + 6]):
-                codepoint = int(text[i + 2 : i + 6], 16)
                 try:
-                    decoded = chr(codepoint)
+                    decoded = chr(int(text[i + 2 : i + 6], 16))
                 except ValueError:
                     decoded = "\ufffd"
                 chars.append(decoded)
@@ -127,7 +112,7 @@ def _json_unescape_map(text: str) -> tuple[str, list[int], list[int]]:
     return "".join(chars), starts, ends
 
 
-def _view_spans(view: str, starts: list[int], ends: list[int]) -> list[tuple[int, int]]:
+def _spans_in_view(view: str, starts: list[int], ends: list[int]):
     spans: list[tuple[int, int]] = []
     for pattern in _PATTERNS:
         for m in pattern.finditer(view):
@@ -135,18 +120,11 @@ def _view_spans(view: str, starts: list[int], ends: list[int]) -> list[tuple[int
     return spans
 
 
-def _multidecode_spans(text: str, decode_fn, max_depth: int = 3) -> list[tuple[int, int]]:
-    """Collect secret spans through up to `max_depth` nested decodings.
-
-    Handles double-encoded exfil (e.g. %252D) by composing index maps
-    across layers instead of rewriting non-secret content.
-    """
+def _multidecode_spans(text: str, decode_fn, max_depth: int = 3):
     spans: list[tuple[int, int]] = []
     if not text:
         return spans
-    cur_view = text
-    cur_starts = list(range(len(text)))
-    cur_ends = [i + 1 for i in range(len(text))]
+    cur_view, cur_starts, cur_ends = text, list(range(len(text))), [i + 1 for i in range(len(text))]
     for _ in range(max_depth):
         nxt_view, s2, e2 = decode_fn(cur_view)
         if nxt_view == cur_view:
@@ -162,8 +140,7 @@ def _multidecode_spans(text: str, decode_fn, max_depth: int = 3) -> list[tuple[i
                     spans.append((lo, hi))
         if not nxt_view:
             break
-        new_starts: list[int] = []
-        new_ends: list[int] = []
+        new_starts, new_ends = [], []
         for j in range(len(nxt_view)):
             s, e = s2[j], e2[j]
             new_starts.append(min(cur_starts[k] for k in range(s, e)))
@@ -172,9 +149,9 @@ def _multidecode_spans(text: str, decode_fn, max_depth: int = 3) -> list[tuple[i
     return spans
 
 
-def _apply_spans(text: str, spans: list[tuple[int, int]]) -> tuple[str, int]:
+def _apply_spans(text: str, spans: list[tuple[int, int]]) -> str:
     if not spans:
-        return text, 0
+        return text
     spans.sort()
     merged: list[list[int]] = [list(spans[0])]
     for s, e in spans[1:]:
@@ -182,64 +159,57 @@ def _apply_spans(text: str, spans: list[tuple[int, int]]) -> tuple[str, int]:
             merged[-1][1] = max(merged[-1][1], e)
         else:
             merged.append([s, e])
-    out = text
     for s, e in reversed(merged):
-        out = out[:s] + _REPLACEMENT + out[e:]
-    return out, len(merged)
+        text = text[:s] + _REPLACEMENT + text[e:]
+    return text
 
 
-def redact_bytes(data: bytes) -> tuple[bytes, int]:
-    text = data.decode("latin-1")
-    total = 0
-    # Fixpoint over plaintext + decodings: catches double-encoded exfil
-    # without rewriting innocent %/backslash content.
-    for _ in range(3):
+def scrub_block(text: str) -> str:
+    for _ in range(2):  # fixpoint: catches double-encoded exfil per block
         prev = text
-        text, n = redact_text(text)
-        total += n
-        text, n = _apply_spans(text, _multidecode_spans(text, _unquote_map))
-        total += n
-        text, n = _apply_spans(text, _multidecode_spans(text, _json_unescape_map))
-        total += n
+        text = _redact_text(text)
+        text = _apply_spans(text, _multidecode_spans(text, _unquote_map))
+        text = _apply_spans(text, _multidecode_spans(text, _json_unescape_map))
+        squashed, index = _squash_map(text)
+        text = _apply_spans(
+            text,
+            [
+                (index[m.start()], index[m.end() - 1] + 1)
+                for pattern in _PATTERNS
+                for m in pattern.finditer(squashed)
+            ],
+        )
         if text == prev:
             break
-    squashed, index = _squash_map(text)
-    spans = [
-        (index[m.start()], index[m.end() - 1] + 1)
-        for pattern in _PATTERNS
-        for m in pattern.finditer(squashed)
-    ]
-    text, n = _apply_spans(text, spans)
-    total += n
-    return text.encode("latin-1", errors="replace"), total
+    return text
 
 
-def redact_tree(root: Path) -> int:
-    total = 0
-    for path in sorted(root.rglob("*")):
-        try:
-            st = path.lstat()
-        except OSError:
+def main() -> None:
+    stdin = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+    tail = b""
+    while True:
+        chunk = stdin.read(_CHUNK)
+        if not chunk:
+            break
+        data = tail + chunk
+        nl = data.rfind(b"\n")
+        if nl == -1 and len(data) < _MAX_PENDING:
+            tail = data
             continue
-        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-            continue
-        if st.st_size > _MAX_FILE_BYTES:
-            print(f"warning: redaction skipped oversized file {path}", file=sys.stderr)
-            continue
-        try:
-            data = path.read_bytes()
-        except OSError as exc:
-            print(f"warning: unreadable file skipped {path}: {exc}", file=sys.stderr)
-            continue
-        try:
-            scrubbed, count = redact_bytes(data)
-        except Exception as exc:
-            print(f"warning: redaction failed {path}: {exc}", file=sys.stderr)
-            continue
-        if count:
-            try:
-                path.write_bytes(scrubbed)
-                total += count
-            except OSError as exc:
-                print(f"warning: rewrite failed {path}: {exc}", file=sys.stderr)
-    return total
+        if nl == -1:
+            cut = len(data)
+            tail = b""
+        else:
+            cut = nl + 1
+            tail = data[cut:]
+        text = scrub_block(data[:cut].decode("latin-1"))
+        stdout.write(text.encode("latin-1", "replace"))
+        stdout.flush()
+    text = scrub_block(tail.decode("latin-1"))
+    stdout.write(text.encode("latin-1", "replace"))
+    stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

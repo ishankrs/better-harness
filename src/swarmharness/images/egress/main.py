@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import ipaddress
 import os
@@ -6,6 +8,7 @@ import socket
 ALLOWED = [d.strip().lower() for d in os.environ.get("ALLOW_DOMAINS", "").split(",") if d.strip()]
 DENY = b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"
 TUNNEL_PORT = 443
+IDLE_TIMEOUT = 300
 
 BLOCKED_NETS = [
     ipaddress.ip_network(n)
@@ -13,17 +16,27 @@ BLOCKED_NETS = [
         "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
         "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
         "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
-        "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+        "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24",
+        "::1/128", "::/128", "fc00::/7", "fe80::/10", "ff00::/8",
+        "::ffff:0:0/96", "64:ff9b::/96", "2001::/32", "2001:db8::/32",
     )
 ]
 
 
+def _canonical(addr):
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
 def _is_public(ip_str: str) -> bool:
     try:
-        addr = ipaddress.ip_address(ip_str)
+        addr = _canonical(ipaddress.ip_address(ip_str))
     except ValueError:
         return False
-    return not any(addr in net for net in BLOCKED_NETS)
+    return not any(
+        addr.version == net.version and addr in net for net in BLOCKED_NETS
+    )
 
 
 def resolve_pinned(host: str) -> str | None:
@@ -45,7 +58,7 @@ def allowed(host: str) -> bool:
 async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
     try:
         while True:
-            chunk = await src.read(65536)
+            chunk = await asyncio.wait_for(src.read(65536), IDLE_TIMEOUT)
             if not chunk:
                 break
             dst.write(chunk)
@@ -101,7 +114,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
 
 
 async def main() -> None:
-    server = await asyncio.start_server(handle, "0.0.0.0", 3128)
+    server = await asyncio.start_server(handle, "0.0.0.0", 3128, limit=64 * 1024)
     await server.serve_forever()
 
 

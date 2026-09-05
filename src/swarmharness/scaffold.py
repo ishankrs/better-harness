@@ -19,9 +19,9 @@ cpus = 1
 memory_mb = 1024
 
 [timeouts]
-build_sec = 300
-agent_sec = 1800
-verifier_sec = 120
+build_timeout_sec = 300
+agent_timeout_sec = 1800
+verifier_timeout_sec = 120
 
 # [oracle]
 # threshold = 1.0
@@ -56,7 +56,6 @@ def main() -> None:
     content = target.read_text(encoding="utf-8", errors="replace").strip() if exists else ""
 
     checks = [
-        {{"name": "file_exists", "score": 1.0 if exists else 0.0}},
         {{"name": "exact_content", "score": 1.0 if content == EXPECTED else 0.0}},
     ]
     score = sum(c["score"] for c in checks) / len(checks)

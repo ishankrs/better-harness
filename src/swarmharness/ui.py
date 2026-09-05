@@ -4,6 +4,7 @@ import sys
 import time
 from contextlib import nullcontext
 
+from rich.markup import escape
 from rich.progress import (
     BarColumn,
     Progress,
@@ -120,15 +121,19 @@ def print_run_summary(console, result) -> None:
         console = _bare_console()
     ok = result.status == "completed" and result.reward.get("score", 0.0) >= 0.999
     color = "green" if ok else ("yellow" if result.status == "completed" else "red")
+    rows = [
+        ("score", f"[bold]{escape(str(result.reward.get('score')))}[/] ({escape(str(result.reward.get('status')))})"),
+        ("checks", result.reward.get("checks", [])),
+        ("agent exit", result.exit_code),
+        ("redactions", result.redactions),
+        ("results", str(result.results_dir)),
+    ]
+    internet_mode = getattr(result, "internet_mode", "")
+    if internet_mode:
+        rows.insert(4, ("internet", internet_mode))
     table = _summary_table(
         title=f"run · {result.status}",
-        rows=[
-            ("score", f"[bold]{result.reward.get('score')}[/] ({result.reward.get('status')})"),
-            ("checks", result.reward.get("checks", [])),
-            ("agent exit", result.exit_code),
-            ("redactions", result.redactions),
-            ("results", str(result.results_dir)),
-        ],
+        rows=rows,
     )
     console.print(table)
 
@@ -140,7 +145,7 @@ def print_oracle_summary(console, result) -> None:
     table = _summary_table(
         title=f"oracle · {'PASSED' if result.passed else 'FAILED'}",
         rows=[
-            ("score", f"[bold]{result.reward.get('score')}[/] ({result.reward.get('status')})"),
+            ("score", f"[bold]{escape(str(result.reward.get('score')))}[/] ({escape(str(result.reward.get('status')))})"),
             ("threshold", result.threshold),
             ("execution", result.status),
             ("results", str(result.results_dir)),
@@ -160,9 +165,10 @@ def _summary_table(title: str, rows):
     for k, v in rows:
         if k == "checks" and isinstance(v, list):
             for c in v:
-                t.add_row(f"  ↳ {c.get('name','check')}", str(c.get("score")))
+                name = escape(str(c.get("name", "check")))
+                t.add_row(f"  ↳ {name}", escape(str(c.get("score"))))
             continue
-        t.add_row(k, str(v))
+        t.add_row(k, escape(str(v)))
     return t
 
 

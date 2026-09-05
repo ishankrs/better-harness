@@ -74,6 +74,7 @@ def run(
     mode: str = typer.Option("multi", "--mode", help="single | multi"),
     keep: bool = typer.Option(False, "--keep", help="keep containers/volumes after the run"),
     model: str = typer.Option(None, "-m", "--model", help="override the task's model id for this run (recorded in run.json)"),
+    min_score: float = typer.Option(None, "--min-score", help="exit non-zero when the final score is below this threshold"),
 ) -> None:
     """Run a task end-to-end: build, execute agent, verify fail-closed, write manifest."""
     if mode not in {"single", "multi"}:
@@ -89,6 +90,9 @@ def run(
         console.print(f"[red]run failed:[/] {exc}")
         raise typer.Exit(1)
     ui.print_run_summary(console, result)
+    if min_score is not None and float(result.reward.get("score", 0.0)) < min_score:
+        console.print(f"[yellow]score {result.reward.get('score')} below --min-score {min_score}[/]")
+        raise typer.Exit(1)
 
 
 @app.command()

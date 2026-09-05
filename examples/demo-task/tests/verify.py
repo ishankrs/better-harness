@@ -7,7 +7,6 @@ content = target.read_text(encoding="utf-8", errors="replace").strip() if exists
 correct = content == "HELLO-FROM-SWARM"
 
 checks = [
-    {"name": "file_exists", "score": 1.0 if exists else 0.0},
     {"name": "exact_content", "score": 1.0 if correct else 0.0},
 ]
 score = sum(c["score"] for c in checks) / len(checks)

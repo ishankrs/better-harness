@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +18,7 @@ from .redact import redact_tree
 from .spec import SpecError, TaskSpec
 
 IMAGES_DIR = Path(__file__).resolve().parent / "images"
+_REDACTED_STAMP = ".redacted"
 
 
 def _normalize_base_url(raw: str) -> tuple[str, str | None]:
@@ -36,6 +39,60 @@ def _normalize_base_url(raw: str) -> tuple[str, str | None]:
     return url, warning
 
 
+def _validate_base_url(url: str) -> str | None:
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in {"http", "https"}:
+        raise SpecError(
+            f"SWARM_LLM_BASE_URL must use http:// or https:// (got {parts.scheme!r})"
+        )
+    if parts.username or parts.password:
+        raise SpecError(
+            "SWARM_LLM_BASE_URL must not embed credentials (userinfo) — "
+            "they would be published in run.json and docker-compose.yml"
+        )
+    if parts.query or parts.fragment:
+        raise SpecError(
+            "SWARM_LLM_BASE_URL must not contain a query string or fragment — "
+            "it would be published verbatim in run.json and docker-compose.yml"
+        )
+    return "key travels in cleartext over http:// upstream" if parts.scheme == "http" else None
+
+
+def _detect_flavor(base_url: str) -> str:
+    flavor = (os.environ.get("SWARM_LLM_FLAVOR") or "").strip().lower()
+    if not flavor:
+        key_hint = (os.environ.get("SWARM_LLM_API_KEY") or "").lower()
+        if "anthropic" in base_url.lower() or key_hint.startswith("sk-ant-"):
+            flavor = "anthropic"
+        else:
+            flavor = "openai"
+    if flavor not in {"openai", "anthropic"}:
+        raise SpecError("SWARM_LLM_FLAVOR must be 'openai' or 'anthropic'")
+    return flavor
+
+
+def _compose_token(compose: dict) -> str:
+    try:
+        return str(compose["services"]["llmproxy"]["environment"]["RUNNER_TOKEN"])
+    except (KeyError, TypeError):
+        return ""
+
+
+def _scrub_compose_token(compose_file: Path, token: str) -> None:
+    if not token or not compose_file.is_file():
+        return
+    try:
+        text = compose_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if token not in text:
+        return
+    try:
+        compose_file.write_text(text.replace(token, "[REDACTED]"), encoding="utf-8")
+    except OSError:
+        pass
+
+
 @dataclass
 class RunResult:
     run_id: str
@@ -44,6 +101,7 @@ class RunResult:
     exit_code: int | None
     reward: dict
     redactions: int
+    internet_mode: str = ""
 
 
 @dataclass
@@ -106,7 +164,7 @@ def _agent_state(compose_file: Path, project: str) -> tuple[str, dict] | None:
         return None
 
 
-def _run_verifier(compose_file: Path, project: str, spec: TaskSpec, results: Path) -> None:
+def _run_verifier(compose_file: Path, project: str, spec: TaskSpec, results: Path) -> int:
     cmd = [
         "docker", "compose", "-f", str(compose_file), "-p", project,
         "--profile", "verify", "run", "--rm", "verifier",
@@ -117,6 +175,21 @@ def _run_verifier(compose_file: Path, project: str, spec: TaskSpec, results: Pat
         reward_path.parent.mkdir(parents=True, exist_ok=True)
         status = "verifier_timeout" if rc == -9 else "verifier_failed"
         reward_path.write_text(json.dumps({"score": 0.0, "status": status}))
+    return rc
+
+
+def _finalize_reward(results: Path, verifier_rc: int) -> dict:
+    _strip_symlinks(results / "verification")
+    redact_tree(results / "verification")
+    reward = _parse_reward(results)
+    if verifier_rc != 0 and reward.get("status") == "ok":
+        reward = {
+            **reward,
+            "score": 0.0,
+            "status": "verifier_failed",
+            "note": f"score ignored — verifier exited {verifier_rc} after writing reward.json",
+        }
+    return reward
 
 
 def _parse_reward(results: Path) -> dict:
@@ -131,6 +204,86 @@ def _parse_reward(results: Path) -> dict:
         return reward
     except Exception:
         return {"score": 0.0, "status": "verifier_failed"}
+
+
+def sweep_stale_results(root: Path) -> None:
+    """Redact any pre-existing run directories that never completed (no run.json).
+
+    Covers trees left raw by SIGKILL/power loss or by older harness versions.
+    """
+    results_dir = root / "results"
+    if not results_dir.is_dir():
+        return
+    for run_dir in sorted(p for p in results_dir.iterdir() if p.is_dir()):
+        if (run_dir / "run.json").exists():
+            continue
+        logs = run_dir / "agent_logs"
+        verification = run_dir / "verification"
+        if logs.is_dir() and not (logs / _REDACTED_STAMP).exists():
+            print(f"sweeping unredacted stale run directory: {run_dir}", file=sys.stderr)
+            try:
+                _strip_symlinks(logs)
+                redact_tree(logs)
+            except Exception as exc:
+                print(f"warning: sweep redaction failed for {run_dir}: {exc}", file=sys.stderr)
+                continue
+            try:
+                (logs / _REDACTED_STAMP).write_text(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+            except OSError:
+                pass
+        if verification.is_dir():
+            try:
+                _strip_symlinks(verification)
+                redact_tree(verification)
+            except Exception as exc:
+                print(f"warning: sweep redaction failed for {verification}: {exc}", file=sys.stderr)
+
+
+def _stamp_redacted(logs_dir: Path) -> None:
+    try:
+        (logs_dir / _REDACTED_STAMP).write_text(time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    except OSError:
+        pass
+
+
+def _strip_symlinks(root: Path) -> int:
+    removed = 0
+    if not root.is_dir():
+        return removed
+    for path in sorted(root.rglob("*")):
+        try:
+            if path.is_symlink():
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _count_newlines_from(path: Path, pos: int) -> tuple[int, int]:
+    try:
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            return pos, 0
+        size = st.st_size
+        if size < pos:
+            pos = 0
+        if size == pos:
+            return pos, 0
+        count = 0
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            os.lseek(fd, pos, os.SEEK_SET)
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                count += chunk.count(b"\n")
+        finally:
+            os.close(fd)
+        return size, count
+    except OSError:
+        return pos, 0
 
 
 def run_task(
@@ -151,20 +304,15 @@ def run_task(
         if not model_override:
             raise SpecError("-m/--model must be a non-empty model id")
         spec.model = model_override
-    flavor = (os.environ.get("SWARM_LLM_FLAVOR") or "").strip().lower()
-    if not flavor:
-        key_hint = (os.environ.get("SWARM_LLM_API_KEY") or "").lower()
-        if "anthropic" in base_url.lower() or key_hint.startswith("sk-ant-"):
-            flavor = "anthropic"
-        else:
-            flavor = "openai"
-    if flavor not in {"openai", "anthropic"}:
-        raise SpecError("SWARM_LLM_FLAVOR must be 'openai' or 'anthropic'")
     base_url, url_warning = _normalize_base_url(base_url)
+    cleartext_warning = _validate_base_url(base_url)
+    flavor = _detect_flavor(base_url)
 
     log = console.log if console else print
     if url_warning:
         log(f"[yellow]{url_warning}[/]")
+    if cleartext_warning:
+        log(f"[yellow]warning: {cleartext_warning} — prefer an https:// upstream[/]")
     if not os.environ.get("SWARM_LLM_API_KEY"):
         log("[yellow]SWARM_LLM_API_KEY not set — proxy will forward without auth header[/]")
 
@@ -174,6 +322,7 @@ def run_task(
 
     run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     project = f"swarm-{spec.name}-{run_id}".lower()
+    sweep_stale_results(spec.root)
     results = spec.root / "results" / run_id
     for sub in ("work", "agent_logs", "verification"):
         (results / sub).mkdir(parents=True, exist_ok=True)
@@ -194,12 +343,10 @@ def run_task(
             return
         try:
             redactions = redact_tree(results / "agent_logs")
+            _stamp_redacted(results / "agent_logs")
             redacted = True
         except Exception:
             pass
-
-    def phase(msg: str) -> None:
-        sys.stdout.flush()
 
     try:
         with display:
@@ -229,6 +376,8 @@ def run_task(
             agent_started = time.monotonic()
             deadline = agent_started + spec.agent_timeout_sec
             state: dict = {}
+            events = 0
+            log_pos = 0
             while True:
                 found = _agent_state(compose_file, project)
                 if found is not None:
@@ -245,12 +394,9 @@ def run_task(
                     state = found[1] if found else {}
                     break
                 elapsed = time.monotonic() - agent_started
-                events = 0
                 if log_path.exists():
-                    try:
-                        events = log_path.read_bytes().count(b"\n")
-                    except OSError:
-                        pass
+                    log_pos, delta = _count_newlines_from(log_path, log_pos)
+                    events += delta
                 display.tick("agent", elapsed, f"{events} events")
                 time.sleep(2)
 
@@ -265,14 +411,16 @@ def run_task(
             )
 
             display.begin("verify", cap=float(spec.verifier_timeout_sec))
+            _strip_symlinks(results / "agent_logs")
             redactions = redact_tree(results / "agent_logs")
             redacted = True
-            _run_verifier(compose_file, project, spec, results)
-            reward = _parse_reward(results)
+            verifier_rc = _run_verifier(compose_file, project, spec, results)
+            reward = _finalize_reward(results, verifier_rc)
             display.finish("verify", "ok", note=f"{len(reward.get('checks', []))} checks · {redactions} redactions")
 
             display.begin("finalize", cap=60.0)
             duration = round(time.monotonic() - started, 1)
+            _scrub_compose_token(compose_file, _compose_token(compose))
             build_manifest(
                 results,
                 {
@@ -292,7 +440,7 @@ def run_task(
                 },
             )
             display.finish("finalize", "ok", note=f"{duration}s total")
-            return RunResult(run_id, results, agent_status, exit_code, reward, redactions)
+            return RunResult(run_id, results, agent_status, exit_code, reward, redactions, spec.internet_mode)
     finally:
         _scrub_unredacted()
         if not keep:
@@ -313,6 +461,7 @@ def _scrub_oracle_logs(results: Path) -> None:
     if logs.exists():
         try:
             redact_tree(logs)
+            _stamp_redacted(logs)
         except Exception:
             pass
 
@@ -332,21 +481,31 @@ def run_oracle(
     base_url = os.environ.get("SWARM_LLM_BASE_URL")
     if not base_url:
         raise SpecError("SWARM_LLM_BASE_URL is required in the environment")
-    base_url, _ = _normalize_base_url(base_url)
+    base_url, url_warning = _normalize_base_url(base_url)
+    cleartext_warning = _validate_base_url(base_url)
+    flavor = _detect_flavor(base_url)
 
     eff_threshold = float(threshold) if threshold is not None else spec.oracle_threshold
 
     from .ui import make_display
 
     display = make_display(console)
+    log = console.log if console else print
+    if url_warning:
+        log(f"[yellow]{url_warning}[/]")
+    if cleartext_warning:
+        log(f"[yellow]warning: {cleartext_warning} — prefer an https:// upstream[/]")
+    if not os.environ.get("SWARM_LLM_API_KEY"):
+        log("[yellow]SWARM_LLM_API_KEY not set — proxy will forward without auth header[/]")
 
     run_id = f"oracle-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     project = f"swarm-oracle-{spec.name}-{run_id}".lower()
+    sweep_stale_results(spec.root)
     results = spec.root / "results" / run_id
     for sub in ("work", "agent_logs", "verification"):
         (results / sub).mkdir(parents=True, exist_ok=True)
 
-    compose = build_compose(spec, results, IMAGES_DIR, mode="single", upstream_base=base_url)
+    compose = build_compose(spec, results, IMAGES_DIR, mode="single", upstream_base=base_url, flavor=flavor)
     compose_file = write_compose(compose, results)
 
     oracle_status = "passed_execution"
@@ -382,8 +541,11 @@ def run_oracle(
             )
 
             display.begin("verify", cap=float(spec.verifier_timeout_sec))
-            _run_verifier(compose_file, project, spec, results)
-            reward = _parse_reward(results)
+            _strip_symlinks(results / "agent_logs")
+            redact_tree(results / "agent_logs")
+            _stamp_redacted(results / "agent_logs")
+            verifier_rc = _run_verifier(compose_file, project, spec, results)
+            reward = _finalize_reward(results, verifier_rc)
             passed = (
                 oracle_status == "passed_execution"
                 and reward.get("status") == "ok"
@@ -393,6 +555,7 @@ def run_oracle(
                            note=f"{len(reward.get('checks', []))} checks")
 
             display.begin("finalize", cap=60.0)
+            _scrub_compose_token(compose_file, _compose_token(compose))
             build_manifest(
                 results,
                 {
@@ -401,6 +564,7 @@ def run_oracle(
                     "task": spec.name,
                     "model": spec.model,
                     "llm_base_url": base_url,
+                    "llm_flavor": flavor,
                     "oracle_status": oracle_status,
                     "threshold": eff_threshold,
                     "passed": passed,

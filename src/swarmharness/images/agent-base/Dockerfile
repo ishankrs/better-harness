@@ -9,8 +9,8 @@ RUN npm i -g "opencode-ai@${OPENCODE_VERSION}" && opencode --version
 
 RUN useradd -ms /bin/bash agent
 
-COPY gen_config.py export_trajectory.py entrypoint.sh /opt/
-RUN chmod 644 /opt/gen_config.py /opt/export_trajectory.py && chmod 755 /opt/entrypoint.sh \
+COPY gen_config.py export_trajectory.py scrub_stream.py entrypoint.sh /opt/
+RUN chmod 644 /opt/gen_config.py /opt/export_trajectory.py /opt/scrub_stream.py && chmod 755 /opt/entrypoint.sh \
     && mkdir -p /logs/agent /workspace /task \
     && chown -R agent:agent /logs /workspace /task
 

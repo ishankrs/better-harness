@@ -5,7 +5,14 @@ from pathlib import Path
 MODE = os.environ.get("MODE", "single")
 MODEL_ID = os.environ["MODEL_ID"]
 PROXY_URL = os.environ.get("PROXY_URL", "http://llmproxy:8080/v1")
-DEPTH = max(0, min(int(os.environ.get("SUBAGENT_DEPTH", "8")), 64))
+def _int_env(name: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(int(os.environ.get(name, str(default))), hi))
+    except (TypeError, ValueError):
+        return default
+
+
+DEPTH = _int_env("SUBAGENT_DEPTH", 8, 0, 64)
 PROVIDER_KIND = os.environ.get("PROVIDER_KIND", "openai-compatible")
 
 if PROVIDER_KIND == "anthropic":
@@ -52,8 +59,8 @@ config = {
             "models": {
                 MODEL_ID: {
                     "limit": {
-                        "context": int(os.environ.get("CONTEXT_LIMIT", "262144")),
-                        "output": int(os.environ.get("OUTPUT_TOKEN_MAX", "32768")),
+                        "context": _int_env("CONTEXT_LIMIT", 262144, 1024, 10_000_000),
+                        "output": _int_env("OUTPUT_TOKEN_MAX", 32768, 256, 1_000_000),
                     }
                 }
             },

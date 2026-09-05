@@ -1,10 +1,14 @@
 import json
 import os
 import pathlib
+import re
+import shutil
 import sqlite3
+import tempfile
 
 DB_PATH = pathlib.Path(os.path.expanduser("~/.local/share/opencode/opencode.db"))
 OUT_DIR = pathlib.Path(os.environ.get("TRAJECTORY_EXPORT_DIR", "/logs/agent/raw_trajectory"))
+_SID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 def _rows(conn: sqlite3.Connection, query: str):
@@ -25,7 +29,33 @@ def main() -> None:
     if not DB_PATH.exists():
         return
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    # Snapshot first: the agent owns the live DB and could still be writing
+    # (or have planted hostile content). A read-only open alone does not
+    # prevent partial-row reads or content tampering; the copy bounds that
+    # to a point-in-time view. Content itself is still agent-controlled
+    # (see L-6) and must not be trusted for grading.
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+        snapshot = pathlib.Path(tf.name)
+    try:
+        try:
+            shutil.copy2(DB_PATH, snapshot)
+        except OSError:
+            return
+        conn = sqlite3.connect(f"file:{snapshot}?mode=ro", uri=True)
+        try:
+            _export_from(conn)
+        except (sqlite3.Error, OSError, ValueError):
+            return
+        finally:
+            conn.close()
+    finally:
+        try:
+            snapshot.unlink()
+        except OSError:
+            pass
+
+
+def _export_from(conn: sqlite3.Connection) -> None:
 
     sessions: dict[str, dict] = {}
     for s in _rows(conn, "SELECT * FROM session ORDER BY time_created"):
@@ -50,6 +80,8 @@ def main() -> None:
             parts_by_message.setdefault(mid, []).append(p)
 
     for sid, msgs in messages_by_session.items():
+        if not isinstance(sid, str) or not _SID_RE.fullmatch(sid):
+            continue
         for m in msgs:
             m["parts"] = parts_by_message.pop(m.get("id"), [])
         s = sessions[sid]

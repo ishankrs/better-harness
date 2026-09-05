@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 import time
 from pathlib import Path
 
@@ -18,12 +19,16 @@ def build_manifest(results: Path, meta: dict) -> Path:
     files = []
     for path in sorted(results.rglob("*")):
         rel = path.relative_to(results)
-        if not path.is_file() or "work" in rel.parts:
+        try:
+            st = path.lstat()
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
             continue
         files.append(
             {
                 "path": str(rel),
-                "bytes": path.stat().st_size,
+                "bytes": st.st_size,
                 "sha256": sha256_file(path),
             }
         )

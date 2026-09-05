@@ -12,7 +12,8 @@ except ModuleNotFoundError:
     import tomli as tomllib
 
 ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
-DOMAIN_RE = re.compile(r"^(\*\.)?[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+DOMAIN_RE = re.compile(r"(\*\.)?[a-z0-9]([a-z0-9.-]*[a-z0-9])?\Z")
+MODEL_RE = re.compile(r"[A-Za-z0-9._/@:+-]{1,200}\Z")
 
 DEFAULTS = {
     "model": "",
@@ -88,16 +89,33 @@ class TaskSpec:
         return p / "solve.sh" if p and (p / "solve.sh").is_file() else None
 
 
+_TIMEOUT_ALIASES = {
+    "build_sec": "build_timeout_sec",
+    "agent_sec": "agent_timeout_sec",
+    "verifier_sec": "verifier_timeout_sec",
+    "build_timeout": "build_timeout_sec",
+    "agent_timeout": "agent_timeout_sec",
+    "verifier_timeout": "verifier_timeout_sec",
+}
+
+
 def _merged(raw: dict) -> dict:
     merged = dict(DEFAULTS)
     for section in ("resources", "timeouts"):
         value = raw.get(section) or {}
         if not isinstance(value, dict):
             raise SpecError(f"task.toml: [{section}] must be a table")
-        merged.update(value)
+        for k, v in value.items():
+            merged[_TIMEOUT_ALIASES.get(k, k)] = v
     for key in DEFAULTS:
         if key in raw:
             merged[key] = raw[key]
+    # top-level legacy aliases (e.g. build_sec = 300 outside [timeouts])
+    for alias, canonical in _TIMEOUT_ALIASES.items():
+        if alias in raw and canonical not in raw:
+            section_vals = (raw.get("timeouts") or {}) if isinstance(raw.get("timeouts"), dict) else {}
+            if alias not in section_vals:
+                merged[canonical] = raw[alias]
     return merged
 
 
@@ -140,6 +158,15 @@ def load_task(root: Path) -> TaskSpec:
     model = str(cfg["model"]).strip()
     if not model:
         raise SpecError("task.toml: 'model' is required (any model id your endpoint serves)")
+    if not MODEL_RE.fullmatch(model):
+        raise SpecError(
+            f"invalid model id {model!r}: allowed characters are letters, digits, "
+            "'.', '_', '/', '@', ':', '+', '-' (max 200 chars)"
+        )
+    if ".." in model or model.startswith(("/", ".")):
+        raise SpecError(
+            f"invalid model id {model!r}: '..' segments and leading '/' or '.' are not allowed"
+        )
 
     verifier_image = str(cfg["verifier_image"])
     if (
@@ -157,7 +184,7 @@ def load_task(root: Path) -> TaskSpec:
     egress = []
     for d in egress_raw:
         d = str(d).strip().lower()
-        if not DOMAIN_RE.match(d):
+        if not DOMAIN_RE.fullmatch(d):
             raise SpecError(f"invalid net_egress domain: {d!r}")
         if d.startswith("*."):
             d = d[2:]
@@ -180,6 +207,11 @@ def load_task(root: Path) -> TaskSpec:
     if internet != "allowlist" and egress:
         raise SpecError(
             'task.toml: net_egress domains are only used when internet = "allowlist"'
+        )
+    if internet == "allowlist" and not egress:
+        raise SpecError(
+            'task.toml: internet = "allowlist" requires at least one net_egress '
+            "domain — an empty allowlist would grant unrestricted network access"
         )
 
     spec = TaskSpec(

@@ -11,6 +11,6 @@ cpus = 1
 memory_mb = 1024
 
 [timeouts]
-build_sec = 300
-agent_sec = 600
-verifier_sec = 120
+build_timeout_sec = 300
+agent_timeout_sec = 600
+verifier_timeout_sec = 120

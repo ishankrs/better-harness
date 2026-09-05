@@ -27,7 +27,7 @@ opencode run \
   --model "swarmproxy/${MODEL_ID}" \
   --format=json \
   --dangerously-skip-permissions \
-  < "$PROMPT" 2>&1 | tee /logs/agent/opencode.txt
+  < "$PROMPT" 2>&1 | python3 /opt/scrub_stream.py | tee /logs/agent/opencode.txt
 RC=${PIPESTATUS[0]}
 set -e
 

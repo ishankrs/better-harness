@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from pathlib import Path
 
 import yaml
@@ -9,7 +10,6 @@ from .spec import TaskSpec
 BASE_IMAGE = "swarmharness/agent-base:latest"
 PROXY_PORT = 8080
 EGRESS_PORT = 3128
-DUMMY_KEY = "dummy-not-a-secret"
 
 
 def build_compose(
@@ -25,24 +25,36 @@ def build_compose(
     proxy_networks = ["internal", "uplink"]
     egress_env: dict[str, str] = {}
     egress_services: list[str] = []
+    runner_token = secrets.token_urlsafe(24)
     services: dict = {}
 
     if spec.internet_mode == "allow":
         networks["open"] = {}
         agent_networks.append("open")
     elif spec.internet_mode == "allowlist":
-        networks["transit"] = {}
+        networks["transit"] = {"internal": True}
         services["egress"] = {
             "build": {"context": str(images_dir / "egress")},
             "environment": {"ALLOW_DOMAINS": ",".join(spec.net_egress)},
-            "networks": ["transit"],
+            "networks": ["transit", "uplink"],
             "mem_limit": "128m",
             "pids_limit": 128,
-            "restart": "no",
+            "restart": "on-failure",
+            "healthcheck": {
+                "test": [
+                    "CMD",
+                    "python",
+                    "-c",
+                    f"import socket;socket.create_connection(('127.0.0.1',{EGRESS_PORT}),2).close()",
+                ],
+                "interval": "3s",
+                "timeout": "3s",
+                "retries": 20,
+                "start_period": "2s",
+            },
         }
         egress_services = ["egress"]
         agent_networks.append("transit")
-        proxy_networks.append("transit")
         egress_env = {
             "HTTPS_PROXY": f"http://egress:{EGRESS_PORT}",
             "HTTP_PROXY": f"http://egress:{EGRESS_PORT}",
@@ -55,12 +67,13 @@ def build_compose(
             "UPSTREAM_BASE": upstream_base,
             "LLM_API_KEY": "${SWARM_LLM_API_KEY:-}",
             "AUTH_MODE": flavor,
+            "RUNNER_TOKEN": runner_token,
         },
         "networks": proxy_networks,
         "extra_hosts": ["host.docker.internal:host-gateway"],
         "mem_limit": "256m",
         "pids_limit": 128,
-        "restart": "no",
+        "restart": "on-failure",
         "healthcheck": {
             "test": [
                 "CMD",
@@ -91,7 +104,7 @@ def build_compose(
         "build": {"context": str(spec.environment_dir)},
         "depends_on": {
             **{"llmproxy": {"condition": "service_healthy"}},
-            **{name: {"condition": "service_started"} for name in egress_services},
+            **{name: {"condition": "service_healthy"} for name in egress_services},
         },
         "environment": {
             "MODE": mode,
@@ -102,7 +115,7 @@ def build_compose(
             "SUBAGENT_DEPTH": str(spec.subagent_depth),
             "MAX_SUBAGENTS": str(spec.max_subagents),
             "PROXY_URL": f"http://llmproxy:{PROXY_PORT}/v1",
-            "PROXY_KEY": DUMMY_KEY,
+            "PROXY_KEY": runner_token,
             "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX": str(spec.output_token_max),
             **egress_env,
         },
@@ -144,7 +157,7 @@ def build_compose(
         "depends_on": verifier_depends,
         "environment": {
             "LLM_BASE_URL": f"http://llmproxy:{PROXY_PORT}/v1",
-            "LLM_API_KEY": DUMMY_KEY,
+            "LLM_API_KEY": runner_token,
         },
         "networks": ["internal"],
         "mem_limit": f"{min(spec.memory_mb, 4096)}m",
